@@ -168,3 +168,100 @@ class MultipleNegativesRankingLossBinaryCustomWeight(nn.Module):
         w = torch.tensor(w, dtype=torch.float, device=scores.device)
         
         return self.cross_entropy_loss(final_preds, labels, weight=w)
+    
+   import torchsort
+
+class MultipleNegativesRankingLossWithSpearman(nn.Module):
+
+    def __init__(self, model: SentenceTransformer, scale: float = 20.0, similarity_fct = util.cos_sim, spearmans = False, spearmans_boost = 1, regularization_strength = 1):
+        """
+        :param model: SentenceTransformer model
+        :param scale: Output of similarity function is multiplied by scale value
+        :param similarity_fct: similarity function between sentence embeddings. By default, cos_sim. Can also be set to dot product (and then set scale to 1)
+        """
+        super(MultipleNegativesRankingLossWithSpearman, self).__init__()
+        self.model = model
+        self.scale = scale
+        self.similarity_fct = similarity_fct
+        self.cross_entropy_loss = nn.BCELoss()
+        self.softmax = nn.Softmax(dim=1)
+        if spearmans:
+          ce_name = 'msmarco-electra-cross-encoder-v26/validation'
+          with open("models/train_set_result_distilation/" + ce_name +"/sorted.scores.groups.of.32.10.CE.hard.negatives.as.triples.batch.size.4.shuffled.pkl", "rb") as h:
+            self.ce_scores = pickle.load(h)
+            self.spearmans = True
+            self.spearmans_boost = spearmans_boost
+            self.regularization_strength = regularization_strength
+          
+    #SR is between -1 and 1. As loss, between 0 and 2.
+    def _spearmanr_loss(self, pred, target, **kw):
+      pred = torchsort.soft_rank(pred, **kw)
+      target = torchsort.soft_rank(target, **kw)
+      pred = pred - pred.mean()
+      pred = pred / pred.norm()
+      target = target - target.mean()
+      target = target / target.norm()
+
+      spearman_r = (pred * target).sum()
+      as_loss = (-spearman_r + 1) / 2
+      return as_loss
+
+
+    def forward(self, sentence_features: Iterable[Dict[str, Tensor]], labels: Tensor):
+
+        reps = [self.model(sentence_feature)['sentence_embedding'] for sentence_feature in sentence_features]
+        embeddings_a = reps[0]
+        embeddings_b = torch.cat(reps[1:])
+        num_passages_per_query = len(embeddings_a) * 2
+
+        # keep scores as a matrix, will use it for the spearmans
+        scores = self.similarity_fct(embeddings_a, embeddings_b) * self.scale
+        
+        #scores_T = torch.transpose(scores, 0, 1)
+        
+        # softmax each row of the matrix and flatten it to a vector
+        scores_softmaxed = self.softmax(scores)    
+        for_binary = torch.flatten(scores_softmaxed)
+
+
+        final_preds = for_binary
+
+
+        #create the labels
+        labels_for_binary = []
+        for i in range(len(scores_softmaxed)):
+          temp = [0] * num_passages_per_query
+          temp[i] = 1
+          labels_for_binary += temp
+
+
+        labels_ground_truth_for_binary = torch.tensor(labels_for_binary, dtype=torch.float, device=scores.device)  # 0 or 1 for irrelevant/relevant passages.
+        
+        ce = self.cross_entropy_loss(final_preds, labels_ground_truth_for_binary)
+
+        if self.spearmans:
+          batch_ce_scores = self.ce_scores[labels[0]]
+
+          targets = []
+
+          margin = 99999 #add this margin to the relevat pasage to correct the cross-encoder
+          relevant_pos = 0
+
+          # create a matrix of target values from cross_encoder scores, same shape as scores matrix.
+          for i in range(0,int(len(batch_ce_scores)/8)):
+            sub_list = batch_ce_scores[i*8:(i+1)*8] 
+
+            sub_list = [i*1000 for i in sub_list]
+            sub_list[relevant_pos] += margin
+
+            relevant_pos += 1
+
+            targets.append(sub_list)
+          targets = torch.tensor(targets).cuda()
+
+
+          s_loss = self._spearmanr_loss(scores, targets, regularization_strength=self.regularization_strength)
+        
+        loss = ce + s_loss 
+
+        return loss
